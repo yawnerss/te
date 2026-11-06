@@ -6,9 +6,9 @@ from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
 
-STALE_AFTER = 15.0   # generous: render cold starts + network jitter
+STALE_AFTER = 15.0
 
-lock = threading.Lock()
+lock = threading.RLock()      # reentrant — log() inside a held lock is now safe
 clients = {}
 job = {
     "target": None,
@@ -153,8 +153,13 @@ def api_start():
         job["cooldown"] = float(data.get("cooldown", 10.0))
         job["active"] = bool(job["target"])
         job["started_at"] = time.time() if job["active"] else None
-    if job["active"]:
-        log(f"JOB START -> {job['target']} rate={job['rate']}/{job['window']}s cd={job['cooldown']}s")
+        active = job["active"]
+        tgt = job["target"]
+        rt = job["rate"]
+        wn = job["window"]
+        cd = job["cooldown"]
+    if active:
+        log(f"JOB START -> {tgt} rate={rt}/{wn}s cd={cd}s")
     else:
         log("JOB START rejected: empty target")
     return jsonify(ok=True)
@@ -172,12 +177,11 @@ def api_stop():
 @app.route("/api/status")
 def api_status():
     now = time.time()
+    dropped = []
     with lock:
-        dead = prune_clients_locked()
-        for cid in dead:
-            log(f"client dropped (stale): {cid}")
+        dropped = prune_clients_locked()
         clist = [{"id": cid, "age": int(now - t)} for cid, t in clients.items()]
-        return jsonify(
+        payload = dict(
             active=job["active"],
             target=job["target"],
             rate=job["rate"],
@@ -187,16 +191,22 @@ def api_status():
             clients=clist,
             log=log_lines[-80:],
         )
+    for cid in dropped:
+        log(f"client dropped (stale): {cid}")
+    return jsonify(payload)
 
 
 @app.route("/api/register", methods=["POST"])
 def api_register():
     data = request.get_json(force=True)
     cid = data.get("id", "unknown")
+    is_new = False
     with lock:
         if cid not in clients:
-            log(f"client registered: {cid}")
+            is_new = True
         clients[cid] = time.time()
+    if is_new:
+        log(f"client registered: {cid}")
     return jsonify(ok=True)
 
 
@@ -204,19 +214,25 @@ def api_register():
 def api_poll():
     data = request.get_json(force=True)
     cid = data.get("id", "unknown")
+    is_new = False
+    stress = None
     with lock:
         prune_clients_locked()
         if cid not in clients:
-            log(f"client registered (via poll): {cid}")
+            is_new = True
         clients[cid] = time.time()
         if job["active"] and job["target"]:
-            return jsonify(
+            stress = dict(
                 action="stress",
                 target=job["target"],
                 rate=job["rate"],
                 window=job["window"],
                 cooldown=job["cooldown"],
             )
+    if is_new:
+        log(f"client registered (via poll): {cid}")
+    if stress:
+        return jsonify(stress)
     return jsonify(action="idle")
 
 
