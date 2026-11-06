@@ -3,7 +3,7 @@ import time
 import uuid
 import requests
 
-SERVER = "http://127.0.0.1:5000"
+SERVER = "https://te-l1hl.onrender.com"
 CLIENT_ID = f"w-{uuid.uuid4().hex[:6]}"
 
 POLL_INTERVAL = 2.0
