@@ -1,3 +1,4 @@
+import os
 import threading
 import time
 from datetime import datetime
@@ -5,10 +6,10 @@ from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
 
-STALE_AFTER = 8.0   # seconds of silence before a client is dropped from the count
+STALE_AFTER = 15.0   # generous: render cold starts + network jitter
 
 lock = threading.Lock()
-clients = {}          # client_id -> last_seen (epoch)
+clients = {}
 job = {
     "target": None,
     "threads": 0,
@@ -27,11 +28,10 @@ def log(msg):
         log_lines.append(line)
         if len(log_lines) > 300:
             log_lines.pop(0)
-    print(line)
+    print(line, flush=True)
 
 
 def prune_clients_locked():
-    """drop clients that haven't polled within STALE_AFTER. caller must hold lock."""
     now = time.time()
     dead = [cid for cid, t in clients.items() if now - t > STALE_AFTER]
     for cid in dead:
@@ -39,7 +39,6 @@ def prune_clients_locked():
     return dead
 
 
-# ---- dashboard html ----
 DASH = """
 <!doctype html>
 <html>
@@ -115,14 +114,16 @@ async function startJob(){
 async function stopJob(){ await fetch('/api/stop', {method:'POST'}); refresh(); }
 
 async function refresh(){
-  const r = await fetch('/api/status');
-  const d = await r.json();
-  document.getElementById('state').textContent = d.active ? 'RUNNING' : 'idle';
-  document.getElementById('state').className = d.active ? 'on' : 'off';
-  document.getElementById('jtarget').textContent = d.target || '—';
-  document.getElementById('nclients').textContent = d.clients.length;
-  document.getElementById('clist').textContent = d.clients.map(c => c.id + ' (' + c.age + 's)').join('  |  ') || 'none';
-  document.getElementById('logbox').textContent = d.log.join('\\n');
+  try {
+    const r = await fetch('/api/status');
+    const d = await r.json();
+    document.getElementById('state').textContent = d.active ? 'RUNNING' : 'idle';
+    document.getElementById('state').className = d.active ? 'on' : 'off';
+    document.getElementById('jtarget').textContent = d.target || '—';
+    document.getElementById('nclients').textContent = d.clients.length;
+    document.getElementById('clist').textContent = d.clients.map(c => c.id + ' (' + c.age + 's)').join('  |  ') || 'none';
+    document.getElementById('logbox').textContent = d.log.join('\\n');
+  } catch(e) {}
 }
 setInterval(refresh, 1500); refresh();
 </script>
@@ -134,6 +135,11 @@ setInterval(refresh, 1500); refresh();
 @app.route("/")
 def index():
     return render_template_string(DASH)
+
+
+@app.route("/health")
+def health():
+    return jsonify(ok=True, ts=time.time())
 
 
 @app.route("/api/start", methods=["POST"])
@@ -183,16 +189,6 @@ def api_status():
         )
 
 
-@app.route("/api/prune", methods=["POST"])
-def api_prune():
-    with lock:
-        dead = prune_clients_locked()
-        for cid in dead:
-            log(f"client dropped (manual): {cid}")
-        alive = len(clients)
-    return jsonify(ok=True, dropped=dead, alive=alive)
-
-
 @app.route("/api/register", methods=["POST"])
 def api_register():
     data = request.get_json(force=True)
@@ -238,4 +234,5 @@ def api_report():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, threaded=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, threaded=True)
