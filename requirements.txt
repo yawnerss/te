@@ -9,4 +9,5 @@ MarkupSafe==2.1.5
 urllib3==2.2.2
 certifi==2024.7.4
 idna==3.7
+flask_cors
 charset-normalizer==3.3.2
