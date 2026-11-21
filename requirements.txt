@@ -5,6 +5,7 @@ Jinja2==3.1.4
 itsdangerous==2.2.0
 click==8.1.7
 blinker==1.8.2
+flask_socketio
 MarkupSafe==2.1.5
 urllib3==2.2.2
 certifi==2024.7.4
